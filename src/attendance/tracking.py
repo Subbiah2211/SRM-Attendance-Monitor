@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from uuid import UUID
 
 from attendance.config import TrackingSettings
@@ -124,26 +125,64 @@ class IouTracker:
             del self._tracks[track_id]
 
 
+class DebounceAction(Enum):
+    EMIT = "emit"
+    SUPPRESS = "suppress"
+    REPLACE = "replace"
+
+
+@dataclass
+class DebounceState:
+    event_id: UUID
+    emitted_at: datetime
+    confidence: float
+
+
 class EventDebouncer:
     """Camera-local publish gate: one event per student per window.
 
     One pipeline process is one camera, so the key is only ``student_id``.
-    Window is measured from the last *published* event, not the last sighting.
+    The window is measured from the first published event, not each update.
+    A later sighting with a higher score replaces that event in place.
     """
 
     def __init__(self, window_seconds: float) -> None:
         self.window_seconds = window_seconds
-        self._last_emitted_at: dict[UUID, datetime] = {}
+        self._state: dict[UUID, DebounceState] = {}
 
-    def allow(
-        self, student_id: UUID, at: datetime, *, identity_changed: bool = False
-    ) -> bool:
+    def decide(
+        self,
+        student_id: UUID,
+        at: datetime,
+        confidence: float,
+        *,
+        identity_changed: bool = False,
+    ) -> DebounceAction:
         if identity_changed or self.window_seconds <= 0:
-            return True
-        last = self._last_emitted_at.get(student_id)
-        if last is None:
-            return True
-        return (at - last).total_seconds() >= self.window_seconds
+            return DebounceAction.EMIT
+        current = self._state.get(student_id)
+        if current is None:
+            return DebounceAction.EMIT
+        if (at - current.emitted_at).total_seconds() >= self.window_seconds:
+            return DebounceAction.EMIT
+        if confidence > current.confidence:
+            return DebounceAction.REPLACE
+        return DebounceAction.SUPPRESS
 
-    def mark(self, student_id: UUID, at: datetime) -> None:
-        self._last_emitted_at[student_id] = at
+    def event_id_for(self, student_id: UUID) -> UUID:
+        return self._state[student_id].event_id
+
+    def mark_emitted(
+        self, event_id: UUID, student_id: UUID, at: datetime, confidence: float
+    ) -> None:
+        self._state[student_id] = DebounceState(
+            event_id=event_id, emitted_at=at, confidence=confidence
+        )
+
+    def mark_replaced(self, student_id: UUID, confidence: float) -> None:
+        current = self._state[student_id]
+        self._state[student_id] = DebounceState(
+            event_id=current.event_id,
+            emitted_at=current.emitted_at,
+            confidence=confidence,
+        )

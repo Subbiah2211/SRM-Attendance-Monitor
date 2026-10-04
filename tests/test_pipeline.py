@@ -14,11 +14,11 @@ from attendance.config import (
     Settings,
     TrackingSettings,
 )
-from attendance.events import InMemoryEventPublisher
+from attendance.events import InMemoryEventPublisher, JsonlEventPublisher
 from attendance.matching import InMemoryEmbeddingStore, Matcher
 from attendance.pipeline import CameraPipeline
 from attendance.tracking import Track
-from attendance.types import BoundingBox, DetectedFace, Frame, SourceMode
+from attendance.types import BoundingBox, DetectedFace, Frame, IdentificationEvent, SourceMode
 from attendance.video import FileVideoSource, open_source
 from attendance.video.sampler import FrameSampler
 from tests.conftest import (
@@ -317,3 +317,116 @@ def test_identity_change_emits_even_inside_debounce_window():
 
     assert [e.university_id for e in publisher.events] == ["CS21B045", "CS21B045"]
     assert pipeline.metrics.events_debounced == 0
+
+
+def test_higher_confidence_updates_the_debounced_event():
+    settings = build_settings()
+    enrolled = _basis(0)
+    weaker = enrolled.copy()
+    weaker[1] = 0.4
+    weaker /= float(np.linalg.norm(weaker))
+    backend = StubBackend(boxes=[FACE_BOX], vectors=[weaker])
+    store = InMemoryEmbeddingStore([enrolled_for("CS21B045", enrolled, backend.model_version)])
+    pipeline, publisher = _pipeline_for(backend, store, settings)
+
+    frame_a, face_a = _face_frame(T0)
+    pipeline._process_face(frame_a, face_a, _new_track(1, T0), time.perf_counter())
+    first = publisher.events[0]
+    assert first.confidence < 0.99
+
+    backend.vectors[0] = enrolled
+    later = T0 + timedelta(seconds=5)
+    frame_b, face_b = _face_frame(later, sequence=1)
+    pipeline._process_face(frame_b, face_b, _new_track(2, later), time.perf_counter())
+
+    assert len(publisher.events) == 1
+    updated = publisher.events[0]
+    assert updated.event_id == first.event_id
+    assert updated.confidence > first.confidence
+    assert updated.track_id == 2
+    assert updated.frame_captured_at == later
+    assert pipeline.metrics.events_published == 1
+    assert pipeline.metrics.events_updated == 1
+    assert pipeline.metrics.events_debounced == 0
+
+
+def test_lower_confidence_does_not_replace_the_debounced_event():
+    settings = build_settings()
+    enrolled = _basis(0)
+    weaker = enrolled.copy()
+    weaker[1] = 0.4
+    weaker /= float(np.linalg.norm(weaker))
+    backend = StubBackend(boxes=[FACE_BOX], vectors=[enrolled])
+    store = InMemoryEmbeddingStore([enrolled_for("CS21B045", enrolled, backend.model_version)])
+    pipeline, publisher = _pipeline_for(backend, store, settings)
+
+    frame_a, face_a = _face_frame(T0)
+    pipeline._process_face(frame_a, face_a, _new_track(1, T0), time.perf_counter())
+    first = publisher.events[0]
+
+    backend.vectors[0] = weaker
+    later = T0 + timedelta(seconds=5)
+    frame_b, face_b = _face_frame(later, sequence=1)
+    pipeline._process_face(frame_b, face_b, _new_track(2, later), time.perf_counter())
+
+    assert len(publisher.events) == 1
+    assert publisher.events[0].event_id == first.event_id
+    assert publisher.events[0].confidence == first.confidence
+    assert publisher.events[0].track_id == 1
+    assert pipeline.metrics.events_updated == 0
+    assert pipeline.metrics.events_debounced == 1
+
+
+def test_jsonl_replace_rewrites_the_matching_line(tmp_path: Path):
+    from attendance.enrollment import student_id_for
+
+    publisher = JsonlEventPublisher(tmp_path)
+    event = IdentificationEvent(
+        student_id=student_id_for("CS21B045"),
+        university_id="CS21B045",
+        camera_id="CAM-1",
+        confidence=0.60,
+        frame_captured_at=T0,
+        model_version="stub-v1",
+        track_id=1,
+        matched_at=T0,
+    )
+    other = IdentificationEvent(
+        student_id=student_id_for("CS21B046"),
+        university_id="CS21B046",
+        camera_id="CAM-1",
+        confidence=0.80,
+        frame_captured_at=T0,
+        model_version="stub-v1",
+        track_id=2,
+        matched_at=T0,
+    )
+    publisher.publish(event)
+    publisher.publish(other)
+    publisher.replace(
+        IdentificationEvent(
+            event_id=event.event_id,
+            student_id=event.student_id,
+            university_id=event.university_id,
+            camera_id=event.camera_id,
+            confidence=0.67,
+            frame_captured_at=T0 + timedelta(seconds=5),
+            model_version=event.model_version,
+            track_id=3,
+            matched_at=T0 + timedelta(seconds=5),
+        )
+    )
+    publisher.close()
+
+    import json
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "identification_events.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert len(rows) == 2
+    updated = next(row for row in rows if row["event_id"] == str(event.event_id))
+    assert updated["confidence"] == 0.67
+    assert updated["track_id"] == 3
+    assert next(row for row in rows if row["university_id"] == "CS21B046")["confidence"] == 0.80

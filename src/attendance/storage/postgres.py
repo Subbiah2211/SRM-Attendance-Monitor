@@ -234,6 +234,29 @@ class PostgresEventPublisher(EventPublisher):
         )
         self.published_count += 1
 
+    def replace(self, event: IdentificationEvent) -> None:
+        self.connection.execute(
+            """
+            UPDATE identification_events
+               SET confidence = %s,
+                   frame_captured_at = %s,
+                   matched_at = coalesce(%s, now()),
+                   track_id = %s,
+                   model_version = %s
+             WHERE event_id = %s
+               AND confidence < %s
+            """,
+            (
+                event.confidence,
+                event.frame_captured_at,
+                event.matched_at,
+                event.track_id,
+                event.model_version,
+                event.event_id,
+                event.confidence,
+            ),
+        )
+
     def log_unresolved(self, detection: UnresolvedDetection) -> None:
         self.connection.execute(
             """

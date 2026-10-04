@@ -55,6 +55,7 @@ class PipelineMetrics:
     recognitions_skipped: int = 0
     events_published: int = 0
     events_debounced: int = 0
+    events_updated: int = 0
     unresolved_quality: int = 0
     unresolved_match: int = 0
     stages: dict[str, Stage] = field(default_factory=dict)
@@ -75,6 +76,7 @@ class PipelineMetrics:
                 "recognitions_skipped": self.recognitions_skipped,
                 "events_published": self.events_published,
                 "events_debounced": self.events_debounced,
+                "events_updated": self.events_updated,
                 "unresolved_quality": self.unresolved_quality,
                 "unresolved_match": self.unresolved_match,
             },

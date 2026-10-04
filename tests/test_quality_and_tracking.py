@@ -7,7 +7,7 @@ import numpy as np
 
 from attendance.config import QualitySettings, TrackingSettings
 from attendance.faces.quality import QualityGate
-from attendance.tracking import EventDebouncer, IouTracker
+from attendance.tracking import DebounceAction, EventDebouncer, IouTracker
 from attendance.types import BoundingBox, DetectedFace
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -135,31 +135,47 @@ def test_stale_tracks_are_evicted():
 def test_debounce_allows_first_sighting():
     debouncer = EventDebouncer(30.0)
     student = uuid4()
-    assert debouncer.allow(student, T0) is True
-    debouncer.mark(student, T0)
-    assert debouncer.allow(student, T0 + timedelta(seconds=29)) is False
-    assert debouncer.allow(student, T0 + timedelta(seconds=30)) is True
+    event_id = uuid4()
+    assert debouncer.decide(student, T0, 0.60) is DebounceAction.EMIT
+    debouncer.mark_emitted(event_id, student, T0, 0.60)
+    assert debouncer.decide(student, T0 + timedelta(seconds=29), 0.60) is DebounceAction.SUPPRESS
+    assert debouncer.decide(student, T0 + timedelta(seconds=30), 0.60) is DebounceAction.EMIT
 
 
 def test_debounce_does_not_block_a_different_student():
     debouncer = EventDebouncer(30.0)
     first, second = uuid4(), uuid4()
-    debouncer.mark(first, T0)
-    assert debouncer.allow(second, T0 + timedelta(seconds=1)) is True
+    debouncer.mark_emitted(uuid4(), first, T0, 0.60)
+    assert debouncer.decide(second, T0 + timedelta(seconds=1), 0.60) is DebounceAction.EMIT
 
 
 def test_debounce_identity_change_always_emits():
     debouncer = EventDebouncer(30.0)
     student = uuid4()
-    debouncer.mark(student, T0)
-    assert debouncer.allow(student, T0 + timedelta(seconds=5), identity_changed=True) is True
+    debouncer.mark_emitted(uuid4(), student, T0, 0.60)
+    assert (
+        debouncer.decide(student, T0 + timedelta(seconds=5), 0.70, identity_changed=True)
+        is DebounceAction.EMIT
+    )
+
+
+def test_debounce_replaces_when_later_score_is_higher():
+    debouncer = EventDebouncer(30.0)
+    student = uuid4()
+    event_id = uuid4()
+    debouncer.mark_emitted(event_id, student, T0, 0.60)
+    assert debouncer.decide(student, T0 + timedelta(seconds=5), 0.63) is DebounceAction.REPLACE
+    assert debouncer.decide(student, T0 + timedelta(seconds=5), 0.59) is DebounceAction.SUPPRESS
+    debouncer.mark_replaced(student, 0.63)
+    assert debouncer.event_id_for(student) == event_id
+    assert debouncer.decide(student, T0 + timedelta(seconds=29), 0.63) is DebounceAction.SUPPRESS
 
 
 def test_debounce_disabled_when_window_is_zero():
     debouncer = EventDebouncer(0)
     student = uuid4()
-    debouncer.mark(student, T0)
-    assert debouncer.allow(student, T0 + timedelta(seconds=1)) is True
+    debouncer.mark_emitted(uuid4(), student, T0, 0.60)
+    assert debouncer.decide(student, T0 + timedelta(seconds=1), 0.60) is DebounceAction.EMIT
 
 
 def test_recognition_reruns_after_the_reconfirm_interval():

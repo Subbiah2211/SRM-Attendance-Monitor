@@ -92,11 +92,12 @@ class TrackingSettings(BaseModel):
     emit_event_once_per_track: bool = True
     """Suppress repeat events for the same student on the same track."""
     emit_debounce_seconds: float = Field(default=30.0, ge=0)
-    """Suppress a second event for the same student on this camera within this window.
+    """One event per student on this camera within this window.
 
-    Tracker fragments (one person, several track ids) otherwise write one row each.
-    Identity changes on a track always emit, even inside the window. 0 disables.
-    Phase 2 still owns class-session uniqueness; this is only doorway chatter.
+    Later sightings in the window do not create a new row. If one scores higher,
+    the existing event is updated in place so the retained confidence is the best
+    observed, not the first. Identity changes on a track always emit a new row.
+    0 disables. Phase 2 still owns class-session uniqueness.
     """
 
 
