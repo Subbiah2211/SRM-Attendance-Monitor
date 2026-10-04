@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import numpy as np
 
 from attendance.config import QualitySettings, TrackingSettings
 from attendance.faces.quality import QualityGate
-from attendance.tracking import IouTracker
+from attendance.tracking import EventDebouncer, IouTracker
 from attendance.types import BoundingBox, DetectedFace
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -129,6 +130,36 @@ def test_stale_tracks_are_evicted():
     for _ in range(4):
         tracker.update([], T0)
     assert tracker.active_tracks == []
+
+
+def test_debounce_allows_first_sighting():
+    debouncer = EventDebouncer(30.0)
+    student = uuid4()
+    assert debouncer.allow(student, T0) is True
+    debouncer.mark(student, T0)
+    assert debouncer.allow(student, T0 + timedelta(seconds=29)) is False
+    assert debouncer.allow(student, T0 + timedelta(seconds=30)) is True
+
+
+def test_debounce_does_not_block_a_different_student():
+    debouncer = EventDebouncer(30.0)
+    first, second = uuid4(), uuid4()
+    debouncer.mark(first, T0)
+    assert debouncer.allow(second, T0 + timedelta(seconds=1)) is True
+
+
+def test_debounce_identity_change_always_emits():
+    debouncer = EventDebouncer(30.0)
+    student = uuid4()
+    debouncer.mark(student, T0)
+    assert debouncer.allow(student, T0 + timedelta(seconds=5), identity_changed=True) is True
+
+
+def test_debounce_disabled_when_window_is_zero():
+    debouncer = EventDebouncer(0)
+    student = uuid4()
+    debouncer.mark(student, T0)
+    assert debouncer.allow(student, T0 + timedelta(seconds=1)) is True
 
 
 def test_recognition_reruns_after_the_reconfirm_interval():

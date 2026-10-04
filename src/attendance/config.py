@@ -90,7 +90,14 @@ class TrackingSettings(BaseModel):
     reconfirm_interval_seconds: float = Field(default=2.0, ge=0)
     """0 re-runs recognition on every sampled frame. The spec's example was 10s."""
     emit_event_once_per_track: bool = True
-    """Phase 2 owns duplicate suppression, but emitting once per track costs nothing here."""
+    """Suppress repeat events for the same student on the same track."""
+    emit_debounce_seconds: float = Field(default=30.0, ge=0)
+    """Suppress a second event for the same student on this camera within this window.
+
+    Tracker fragments (one person, several track ids) otherwise write one row each.
+    Identity changes on a track always emit, even inside the window. 0 disables.
+    Phase 2 still owns class-session uniqueness; this is only doorway chatter.
+    """
 
 
 class PrivacySettings(BaseModel):

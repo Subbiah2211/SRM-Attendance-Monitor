@@ -7,9 +7,10 @@ box to person B. If recognition is skipped on the strength of the track alone, p
 silently inherits student A's identity and nothing downstream can detect it. That is
 precisely the false-accept case spec section 6.3 says to keep rarest.
 
-So tracks here serve two narrower purposes: suppressing duplicate events for one
-person walking past, and carrying a running identity that gets re-verified on a short
-interval. Recognition still runs regularly, which the GPU headroom in section 7 allows.
+So tracks here associate detections across nearby frames and carry a running identity
+that is re-verified on a short interval. Duplicate events are suppressed once per
+track and again by a short per-student debounce. Recognition still runs regularly,
+which the GPU headroom in section 7 allows.
 """
 
 from __future__ import annotations
@@ -121,3 +122,28 @@ class IouTracker:
         ]
         for track_id in stale:
             del self._tracks[track_id]
+
+
+class EventDebouncer:
+    """Camera-local publish gate: one event per student per window.
+
+    One pipeline process is one camera, so the key is only ``student_id``.
+    Window is measured from the last *published* event, not the last sighting.
+    """
+
+    def __init__(self, window_seconds: float) -> None:
+        self.window_seconds = window_seconds
+        self._last_emitted_at: dict[UUID, datetime] = {}
+
+    def allow(
+        self, student_id: UUID, at: datetime, *, identity_changed: bool = False
+    ) -> bool:
+        if identity_changed or self.window_seconds <= 0:
+            return True
+        last = self._last_emitted_at.get(student_id)
+        if last is None:
+            return True
+        return (at - last).total_seconds() >= self.window_seconds
+
+    def mark(self, student_id: UUID, at: datetime) -> None:
+        self._last_emitted_at[student_id] = at

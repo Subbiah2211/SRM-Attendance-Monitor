@@ -46,6 +46,7 @@ HNSW_FILE = "002_hnsw_index.sql"
 def connect(dsn: str) -> psycopg.Connection:
     connection = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
     register_vector(connection)
+    connection.execute("SET search_path TO identity, attendance, public")
     return connection
 
 

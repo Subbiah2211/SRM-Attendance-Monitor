@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -15,10 +17,18 @@ from attendance.config import (
 from attendance.events import InMemoryEventPublisher
 from attendance.matching import InMemoryEmbeddingStore, Matcher
 from attendance.pipeline import CameraPipeline
-from attendance.types import BoundingBox, SourceMode
+from attendance.tracking import Track
+from attendance.types import BoundingBox, DetectedFace, Frame, SourceMode
 from attendance.video import FileVideoSource, open_source
 from attendance.video.sampler import FrameSampler
-from tests.conftest import StubBackend, enrolled_for
+from tests.conftest import (
+    FRAME_HEIGHT,
+    FRAME_WIDTH,
+    StubBackend,
+    _frontal_landmarks,
+    checkerboard,
+    enrolled_for,
+)
 
 FACE_BOX = BoundingBox(200, 150, 320, 300)
 
@@ -210,3 +220,100 @@ def _basis(index: int, dim: int = 8) -> np.ndarray:
     vector = np.zeros(dim, dtype=np.float32)
     vector[index] = 1.0
     return vector
+
+
+T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _pipeline_for(backend: StubBackend, store: InMemoryEmbeddingStore, settings: Settings):
+    publisher = InMemoryEventPublisher()
+    pipeline = CameraPipeline(
+        camera=CameraSettings(camera_id="CAM-1", source="unused.mp4"),
+        settings=settings,
+        backend=backend,
+        matcher=Matcher(store, settings.matching),
+        publisher=publisher,
+    )
+    return pipeline, publisher
+
+
+def _face_frame(captured_at: datetime, sequence: int = 0) -> tuple[Frame, DetectedFace]:
+    frame = Frame(
+        camera_id="CAM-1",
+        image=checkerboard(FRAME_HEIGHT, FRAME_WIDTH),
+        captured_at=captured_at,
+        sequence=sequence,
+    )
+    face = DetectedFace(
+        box=FACE_BOX,
+        detector_score=0.95,
+        landmarks=_frontal_landmarks(FACE_BOX),
+    )
+    return frame, face
+
+
+def _new_track(track_id: int, at: datetime) -> Track:
+    return Track(track_id=track_id, box=FACE_BOX, first_seen_at=at, last_seen_at=at)
+
+
+def test_second_track_for_same_student_is_debounced():
+    settings = build_settings()
+    backend = StubBackend(boxes=[FACE_BOX])
+    store = InMemoryEmbeddingStore(
+        [enrolled_for("CS21B045", backend.vectors[0], backend.model_version)]
+    )
+    pipeline, publisher = _pipeline_for(backend, store, settings)
+
+    frame_a, face_a = _face_frame(T0)
+    pipeline._process_face(frame_a, face_a, _new_track(1, T0), time.perf_counter())
+
+    later = T0 + timedelta(seconds=5)
+    frame_b, face_b = _face_frame(later, sequence=1)
+    pipeline._process_face(frame_b, face_b, _new_track(2, later), time.perf_counter())
+
+    assert [e.university_id for e in publisher.events] == ["CS21B045"]
+    assert pipeline.metrics.events_published == 1
+    assert pipeline.metrics.events_debounced == 1
+
+
+def test_same_student_emits_again_after_debounce_window():
+    settings = build_settings()
+    backend = StubBackend(boxes=[FACE_BOX])
+    store = InMemoryEmbeddingStore(
+        [enrolled_for("CS21B045", backend.vectors[0], backend.model_version)]
+    )
+    pipeline, publisher = _pipeline_for(backend, store, settings)
+
+    frame_a, face_a = _face_frame(T0)
+    pipeline._process_face(frame_a, face_a, _new_track(1, T0), time.perf_counter())
+
+    later = T0 + timedelta(seconds=30)
+    frame_b, face_b = _face_frame(later, sequence=1)
+    pipeline._process_face(frame_b, face_b, _new_track(2, later), time.perf_counter())
+
+    assert len(publisher.events) == 2
+    assert pipeline.metrics.events_debounced == 0
+
+
+def test_identity_change_emits_even_inside_debounce_window():
+    from attendance.enrollment import student_id_for
+
+    settings = build_settings()
+    backend = StubBackend(boxes=[FACE_BOX])
+    store = InMemoryEmbeddingStore(
+        [enrolled_for("CS21B045", backend.vectors[0], backend.model_version)]
+    )
+    pipeline, publisher = _pipeline_for(backend, store, settings)
+
+    frame_a, face_a = _face_frame(T0)
+    pipeline._process_face(frame_a, face_a, _new_track(1, T0), time.perf_counter())
+
+    later = T0 + timedelta(seconds=2)
+    frame_b, face_b = _face_frame(later, sequence=1)
+    track = _new_track(2, later)
+    track.student_id = student_id_for("CS21B046")
+    track.university_id = "CS21B046"
+    pipeline._process_face(frame_b, face_b, track, time.perf_counter())
+
+    assert [e.university_id for e in publisher.events] == ["CS21B045", "CS21B045"]
+    assert pipeline.metrics.events_debounced == 0

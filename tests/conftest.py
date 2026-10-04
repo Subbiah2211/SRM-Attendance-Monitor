@@ -37,6 +37,23 @@ def synthetic_video(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def long_synthetic_video(tmp_path: Path) -> Path:
+    """Twelve seconds at 30 FPS, long enough that sample spreading matters."""
+    path = tmp_path / "long.mp4"
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (FRAME_WIDTH, FRAME_HEIGHT)
+    )
+    assert writer.isOpened(), "OpenCV could not open an mp4 writer"
+    base = checkerboard(FRAME_HEIGHT, FRAME_WIDTH)
+    for index in range(360):
+        frame = base.copy()
+        cv2.circle(frame, (20 + index, 240), 30, (20, 180, 250), -1)
+        writer.write(frame)
+    writer.release()
+    return path
+
+
 class StubBackend(FaceBackend):
     """Detects a fixed set of boxes and returns a fixed vector per box.
 

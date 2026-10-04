@@ -14,6 +14,6 @@
 --      case honest for the common query shape.
 
 CREATE INDEX IF NOT EXISTS face_embeddings_hnsw_cosine_idx
-    ON face_embeddings
+    ON identity.face_embeddings
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 200);

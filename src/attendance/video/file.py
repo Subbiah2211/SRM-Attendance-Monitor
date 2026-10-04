@@ -44,6 +44,21 @@ class FileVideoSource(VideoSource):
         return float(fps) if fps and fps > 0 else None
 
     @property
+    def frame_count(self) -> int | None:
+        """Total frames, or None if the container does not report it."""
+        if self._capture is None:
+            return None
+        count = self._capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        return int(count) if count and count > 0 else None
+
+    @property
+    def duration_seconds(self) -> float | None:
+        count, fps = self.frame_count, self.native_fps
+        if not count or not fps:
+            return None
+        return count / fps
+
+    @property
     def is_exhausted(self) -> bool:
         return self._exhausted
 

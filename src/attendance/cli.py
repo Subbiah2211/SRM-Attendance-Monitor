@@ -206,6 +206,128 @@ def db_consume(
     typer.echo(f"Claimed {len(rows)} event(s).", err=True)
 
 
+@app.command("inspect")
+def inspect_command(
+    source: Annotated[str, typer.Argument(help="Video file or RTSP URL to probe.")],
+    backend: Annotated[str, typer.Option(help="Face backend to use.")] = "insightface",
+    max_frames: Annotated[int, typer.Option(help="Sampled frames to examine.")] = 20,
+    spread: Annotated[
+        bool,
+        typer.Option(
+            "--spread/--no-spread",
+            help="Spread the frame budget across the whole clip instead of the first few seconds.",
+        ),
+    ] = True,
+    target_fps: Annotated[float | None, typer.Option(help="Override sampling rate.")] = None,
+    save_frames: Annotated[
+        Path | None, typer.Option(help="Write annotated frames here for visual checking.")
+    ] = None,
+    save_crops: Annotated[
+        Path | None, typer.Option(help="Write the aligned face crops here.")
+    ] = None,
+) -> None:
+    """Check whether a clip is usable before enrolling or matching against it.
+
+    Runs detection and the quality gate and reports what it found. Nothing is matched,
+    stored or published, so this is safe to point at any footage.
+    """
+    configure_logging()
+    from attendance.inspect import inspect_source
+
+    settings = Settings()
+    if target_fps is not None:
+        settings.sampling.target_fps = target_fps
+
+    report = inspect_source(
+        source=source,
+        backend=build_backend(settings, backend),
+        sampling=settings.sampling,
+        quality=settings.quality,
+        max_frames=max_frames,
+        spread=spread,
+        save_frames_dir=save_frames,
+        save_crops_dir=save_crops,
+    )
+
+    typer.echo(json.dumps(report.summary(), indent=2))
+    typer.echo("")
+    for note in report.advice(settings.quality):
+        typer.echo(f"* {note}")
+    if report.frames_written:
+        typer.echo(f"\nWrote {report.frames_written} annotated frame(s) to {save_frames}")
+    if report.crops_written:
+        typer.echo(f"Wrote {report.crops_written} face crop(s) to {save_crops}")
+
+
+@app.command("extract-references")
+def extract_references(
+    source: Annotated[str, typer.Argument(help="Video file or RTSP URL.")],
+    output: Annotated[Path, typer.Option(help="Directory to fill with candidates.")] = Path(
+        "var/candidates"
+    ),
+    backend: Annotated[str, typer.Option(help="Face backend to use.")] = "insightface",
+    max_frames: Annotated[
+        int | None, typer.Option(help="Sampled frames to scan. Default scans the whole clip.")
+    ] = None,
+    similarity: Annotated[
+        float,
+        typer.Option(
+            help="Cosine similarity at which two track fragments are treated as one person."
+        ),
+    ] = 0.5,
+    max_per_person: Annotated[int, typer.Option(help="Reference photos to keep per person.")] = 3,
+) -> None:
+    """Pull reference photos out of a clip, one directory per person.
+
+    For when the clip is the only material available. Track fragments are grouped by face
+    similarity, so a person the tracker split across many tracks still produces a single
+    'person_NN' directory. Rename each to that student's university_id before enrolling.
+
+    Reference photos taken from the same camera as runtime frames also avoid the domain
+    gap that hurts accuracy when enrollment photos come from elsewhere.
+    """
+    configure_logging()
+    from attendance.inspect import extract_reference_candidates
+
+    settings = Settings()
+    result = extract_reference_candidates(
+        report_dir=output,
+        source=source,
+        backend=build_backend(settings, backend),
+        sampling=settings.sampling,
+        quality=settings.quality,
+        max_frames=max_frames,
+        similarity_threshold=similarity,
+        max_per_person=max_per_person,
+    )
+    if result.people_found == 0:
+        typer.echo(
+            "No usable faces found. Run 'attendance inspect' on the same clip to see why.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Scanned {result.frames_scanned} frame(s): {result.tracks_found} track fragment(s) "
+        f"grouped into {result.people_found} person(s)."
+    )
+    if result.fragmentation and result.fragmentation > 1.5:
+        typer.echo(
+            f"  Tracker produced {result.fragmentation:.1f} fragments per person, which is "
+            "normal at a low sampling rate; grouping by face similarity absorbed it."
+        )
+    typer.echo(f"Wrote {result.references_written} reference photo(s) to {output}/person_NN/")
+    typer.echo(f"Cluster map: {output}/clusters.json")
+    typer.echo(
+        "\nRename each person_NN directory to that student's university_id, then:\n"
+        f"  attendance enroll {output} --output var/enrolled.npz"
+    )
+    typer.echo(
+        "If one person still appears twice, lower --similarity; if two people were merged, "
+        "raise it. Previous person_* folders in the output directory are replaced each run."
+    )
+
+
 @app.command("enroll")
 def enroll(
     photo_dir: Annotated[Path, typer.Argument(help="Reference photos, grouped by university_id.")],

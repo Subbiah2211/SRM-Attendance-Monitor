@@ -24,7 +24,7 @@ from attendance.faces.base import FaceBackend
 from attendance.faces.quality import QualityGate
 from attendance.matching.base import Matcher
 from attendance.metrics import PipelineMetrics
-from attendance.tracking import IouTracker, Track
+from attendance.tracking import EventDebouncer, IouTracker, Track
 from attendance.types import (
     BoundingBox,
     DetectedFace,
@@ -55,6 +55,7 @@ class CameraPipeline:
         self.publisher = publisher
         self.quality_gate = QualityGate(settings.quality)
         self.tracker = IouTracker(settings.tracking)
+        self.debouncer = EventDebouncer(settings.tracking.emit_debounce_seconds)
         self.metrics = PipelineMetrics()
 
     def run(self, max_frames: int | None = None) -> PipelineMetrics:
@@ -174,12 +175,15 @@ class CameraPipeline:
 
         candidate = result.best
         previous_student = track.student_id
+        identity_changed = (
+            previous_student is not None and previous_student != candidate.student_id
+        )
         track.student_id = candidate.student_id
         track.university_id = candidate.university_id
         track.best_similarity = candidate.similarity
         track.similarity_history.append(candidate.similarity)
 
-        if previous_student is not None and previous_student != candidate.student_id:
+        if identity_changed:
             # Re-confirmation disagreed with the first match. Worth surfacing: it means
             # either a borderline pair of students or a track that swapped subjects.
             log.warning(
@@ -192,7 +196,20 @@ class CameraPipeline:
             )
 
         already_reported = track.event_emitted and self.settings.tracking.emit_event_once_per_track
-        if already_reported and previous_student == candidate.student_id:
+        if already_reported and not identity_changed:
+            return
+
+        if not self.debouncer.allow(
+            candidate.student_id, frame.captured_at, identity_changed=identity_changed
+        ):
+            self.metrics.events_debounced += 1
+            log.info(
+                "identification_debounced",
+                university_id=candidate.university_id,
+                camera_id=frame.camera_id,
+                track_id=track.track_id,
+                confidence=round(candidate.similarity, 3),
+            )
             return
 
         event = IdentificationEvent(
@@ -206,6 +223,7 @@ class CameraPipeline:
             matched_at=datetime.now(UTC),
         )
         self.publisher.publish(event)
+        self.debouncer.mark(candidate.student_id, frame.captured_at)
         track.event_emitted = True
         self.metrics.events_published += 1
         self.metrics.record("processing_latency_ms", _elapsed_ms(processing_started))
