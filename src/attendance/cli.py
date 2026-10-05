@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Annotated
@@ -15,6 +16,7 @@ from attendance.faces import build_backend
 from attendance.logging import configure_logging
 from attendance.matching import InMemoryEmbeddingStore, Matcher
 from attendance.pipeline import CameraPipeline
+from attendance.types import EnrolledEmbedding
 
 app = typer.Typer(add_completion=False, help="Phase 1 attendance identification pipeline.")
 models_app = typer.Typer(help="Model weight management.")
@@ -81,6 +83,58 @@ def models_info(
     )
 
 
+def _read_roster(path: Path) -> dict[str, str]:
+    names: dict[str, str] = {}
+    with path.open() as handle:
+        for row in csv.DictReader(handle):
+            names[row["university_id"].strip()] = row["full_name"].strip()
+    return names
+
+
+def _persist_enrollment(
+    records: list[EnrolledEmbedding],
+    roster: Path | None,
+    dsn: str | None,
+) -> int:
+    from attendance.storage import (
+        PgVectorEmbeddingStore,
+        connect,
+        fetch_student_names,
+        upsert_student,
+    )
+
+    university_ids = {record.university_id for record in records}
+    roster_names = _read_roster(roster) if roster is not None else {}
+
+    connection = connect(_require_dsn(dsn))
+    try:
+        names, missing = enrollment.resolve_enrollment_names(
+            university_ids,
+            roster_names,
+            fetch_student_names(connection, sorted(university_ids)),
+        )
+        if missing:
+            typer.echo(
+                f"No full_name for {len(missing)} student(s): {', '.join(missing[:5])}"
+                f"{' ...' if len(missing) > 5 else ''}\n"
+                "Provide --roster so student records carry real names rather than invented ones.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+
+        for university_id in university_ids:
+            upsert_student(
+                connection,
+                student_id=enrollment.student_id_for(university_id),
+                university_id=university_id,
+                full_name=names[university_id],
+            )
+        store = PgVectorEmbeddingStore(connection, model_version=records[0].model_version)
+        return store.add_enrolled(records)
+    finally:
+        connection.close()
+
+
 def _require_dsn(dsn: str | None) -> str:
     resolved = dsn or Settings().database.dsn
     if not resolved:
@@ -132,53 +186,21 @@ def db_migrate(
 
 @db_app.command("load-enrollment")
 def db_load_enrollment(
-    bundle: Annotated[Path, typer.Argument(help="Embedding bundle from 'enroll'.")],
+    bundle: Annotated[Path, typer.Argument(help="Embedding bundle from 'enroll --store memory'.")],
     roster: Annotated[
         Path | None,
-        typer.Option(help="CSV of university_id,full_name. Required to create students."),
+        typer.Option(
+            help="CSV of university_id,full_name. Needed for students not already in the DB."
+        ),
     ] = None,
     dsn: Annotated[str | None, typer.Option(help="Postgres DSN.")] = None,
 ) -> None:
     """Load an embedding bundle into Postgres, creating student rows as needed."""
-    import csv
-
-    from attendance.storage import PgVectorEmbeddingStore, connect, upsert_student
-
     records = enrollment.load_embeddings(bundle)
     if not records:
         typer.echo("Bundle is empty.", err=True)
         raise typer.Exit(code=1)
-
-    names: dict[str, str] = {}
-    if roster is not None:
-        with roster.open() as handle:
-            for row in csv.DictReader(handle):
-                names[row["university_id"].strip()] = row["full_name"].strip()
-
-    missing = sorted({r.university_id for r in records} - names.keys())
-    if missing:
-        typer.echo(
-            f"No full_name for {len(missing)} student(s): {', '.join(missing[:5])}"
-            f"{' ...' if len(missing) > 5 else ''}\n"
-            "Provide --roster so student records carry real names rather than invented ones.",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-
-    connection = connect(_require_dsn(dsn))
-    try:
-        for university_id in {r.university_id for r in records}:
-            upsert_student(
-                connection,
-                student_id=enrollment.student_id_for(university_id),
-                university_id=university_id,
-                full_name=names[university_id],
-            )
-        store = PgVectorEmbeddingStore(connection, model_version=records[0].model_version)
-        count = store.add_enrolled(records)
-    finally:
-        connection.close()
-
+    count = _persist_enrollment(records, roster=roster, dsn=dsn)
     typer.echo(
         f"Loaded {count} embedding(s) for {len({r.university_id for r in records})} student(s)."
     )
@@ -320,7 +342,7 @@ def extract_references(
     typer.echo(f"Cluster map: {output}/clusters.json")
     typer.echo(
         "\nRename each person_NN directory to that student's university_id, then:\n"
-        f"  attendance enroll {output} --output var/enrolled.npz"
+        f"  attendance enroll {output} --roster var/enroll/roster.csv"
     )
     typer.echo(
         "If one person still appears twice, lower --similarity; if two people were merged, "
@@ -331,14 +353,26 @@ def extract_references(
 @app.command("enroll")
 def enroll(
     photo_dir: Annotated[Path, typer.Argument(help="Reference photos, grouped by university_id.")],
-    output: Annotated[Path, typer.Option(help="Where to write the embedding bundle.")] = Path(
-        "var/enrolled.npz"
-    ),
+    store_kind: Annotated[
+        str,
+        typer.Option("--store", help="Where to write embeddings: postgres or memory."),
+    ] = "postgres",
+    roster: Annotated[
+        Path | None,
+        typer.Option(
+            help="CSV of university_id,full_name. Needed for students not already in the DB."
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Also write a portable .npz bundle. Required with --store memory."),
+    ] = None,
     backend: Annotated[str, typer.Option(help="Face backend to use.")] = "insightface",
     max_per_student: Annotated[int, typer.Option(help="Reference photos per student.")] = 3,
     enforce_quality: Annotated[
         bool, typer.Option(help="Apply the runtime quality gate to reference photos too.")
     ] = True,
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN when --store postgres.")] = None,
 ) -> None:
     """Build embeddings from reference photos using the runtime detection path."""
     configure_logging()
@@ -356,10 +390,24 @@ def enroll(
         typer.echo("No embeddings produced. Nothing written.", err=True)
         raise typer.Exit(code=1)
 
-    enrollment.save_embeddings(result.embeddings, output)
+    destinations: list[str] = []
+    if store_kind == "postgres":
+        count = _persist_enrollment(result.embeddings, roster=roster, dsn=dsn)
+        destinations.append(f"postgres ({count} embedding(s))")
+    elif store_kind == "memory":
+        if output is None:
+            output = Path("var/enrolled.npz")
+    else:
+        typer.echo(f"Unknown --store value: {store_kind}", err=True)
+        raise typer.Exit(code=2)
+
+    if output is not None:
+        enrollment.save_embeddings(result.embeddings, output)
+        destinations.append(str(output))
+
     typer.echo(
         f"Enrolled {result.student_count} student(s), "
-        f"{len(result.embeddings)} embedding(s) -> {output}"
+        f"{len(result.embeddings)} embedding(s) -> {', '.join(destinations)}"
     )
     for path, reason in result.skipped:
         typer.echo(f"  skipped {path.name}: {reason}")
@@ -369,13 +417,14 @@ def enroll(
 def run(
     source: Annotated[str, typer.Argument(help="RTSP URL, GStreamer pipeline, or video file.")],
     camera_id: Annotated[str, typer.Option(help="Identifier carried on every event.")] = "CAM-1",
-    enrolled: Annotated[Path, typer.Option(help="Embedding bundle from 'enroll'.")] = Path(
-        "var/enrolled.npz"
-    ),
+    enrolled: Annotated[
+        Path,
+        typer.Option(help="Embedding bundle used only with --store memory."),
+    ] = Path("var/enrolled.npz"),
     backend: Annotated[str, typer.Option(help="Face backend to use.")] = "insightface",
     store_kind: Annotated[
-        str, typer.Option("--store", help="Where embeddings and events live: memory or postgres.")
-    ] = "memory",
+        str, typer.Option("--store", help="Where embeddings and events live: postgres or memory.")
+    ] = "postgres",
     dsn: Annotated[str | None, typer.Option(help="Postgres DSN when --store postgres.")] = None,
     target_fps: Annotated[float | None, typer.Option(help="Override sampling rate.")] = None,
     threshold: Annotated[float | None, typer.Option(help="Override similarity threshold.")] = None,

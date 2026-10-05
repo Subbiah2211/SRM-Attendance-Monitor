@@ -190,7 +190,25 @@ class PgVectorEmbeddingStore(EmbeddingStore):
                     for record in records
                 ],
             )
+            student_ids = list({record.student_id for record in records})
+            if student_ids:
+                cursor.execute(
+                    "UPDATE students SET face_registered = true WHERE student_id = ANY(%s)",
+                    (student_ids,),
+                )
         return len(records)
+
+
+def fetch_student_names(
+    connection: psycopg.Connection, university_ids: Sequence[str]
+) -> dict[str, str]:
+    if not university_ids:
+        return {}
+    rows = connection.execute(
+        "SELECT university_id, full_name FROM students WHERE university_id = ANY(%s)",
+        (list(university_ids),),
+    ).fetchall()
+    return {row["university_id"]: row["full_name"] for row in rows}
 
 
 class PostgresEventPublisher(EventPublisher):

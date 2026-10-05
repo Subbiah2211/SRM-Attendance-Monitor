@@ -6,8 +6,8 @@ spec is right that this matters more for accuracy than almost anything else, and
 easy to lose by accident: a separate enrollment script that crops differently or skips
 alignment produces vectors that quietly do not compare well.
 
-Persistence is a portable ``.npz`` file for now, since the Postgres schema is on hold.
-The same ``EnrolledEmbedding`` records load straight into either store.
+The same ``EnrolledEmbedding`` records load into Postgres (the default) or a
+portable ``.npz`` bundle for offline runs.
 """
 
 from __future__ import annotations
@@ -49,6 +49,17 @@ class EnrollmentResult:
 
 def student_id_for(university_id: str) -> UUID:
     return uuid5(_STUDENT_NAMESPACE, university_id)
+
+
+def resolve_enrollment_names(
+    university_ids: set[str],
+    roster_names: dict[str, str],
+    existing_names: dict[str, str],
+) -> tuple[dict[str, str], list[str]]:
+    """Roster wins over names already in the database. Returns (names, missing)."""
+    names = {**existing_names, **roster_names}
+    missing = sorted(university_ids - names.keys())
+    return names, missing
 
 
 def enroll_directory(

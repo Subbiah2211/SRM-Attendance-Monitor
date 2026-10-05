@@ -112,3 +112,27 @@ def test_vectors_from_a_different_model_are_never_compared():
 def test_empty_store_yields_no_candidates():
     matcher = Matcher(InMemoryEmbeddingStore(), MatchingSettings())
     assert matcher.match(query(unit(1, 0, 0))).outcome is MatchOutcome.NO_CANDIDATES
+
+
+def test_roster_names_win_over_existing_database_names():
+    from attendance.enrollment import resolve_enrollment_names
+
+    names, missing = resolve_enrollment_names(
+        {"202405CS001", "202405CS002"},
+        roster_names={"202405CS001": "Oviya"},
+        existing_names={"202405CS001": "Old Name", "202405CS002": "Rithika"},
+    )
+    assert names == {"202405CS001": "Oviya", "202405CS002": "Rithika"}
+    assert missing == []
+
+
+def test_missing_enrollment_names_are_reported():
+    from attendance.enrollment import resolve_enrollment_names
+
+    names, missing = resolve_enrollment_names(
+        {"202405CS001", "202405CS002"},
+        roster_names={"202405CS001": "Oviya"},
+        existing_names={},
+    )
+    assert names == {"202405CS001": "Oviya"}
+    assert missing == ["202405CS002"]

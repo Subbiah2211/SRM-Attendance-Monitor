@@ -5,6 +5,7 @@ from attendance.storage.postgres import (
     check_capabilities,
     claim_events,
     connect,
+    fetch_student_names,
     upsert_camera,
     upsert_student,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "check_capabilities",
     "claim_events",
     "connect",
+    "fetch_student_names",
     "upsert_camera",
     "upsert_student",
 ]
